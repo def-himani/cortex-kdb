@@ -1,0 +1,23 @@
+# Python virtual environment
+.venv/
+
+# Python generated files
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Testing and build artifacts
+.pytest_cache/
+build/
+dist/
+
+# Secrets
+.env
+.env.*
+
+# Local database
+/lake/
+
+# Operating system files
+.DS_Store
+Thumbs.db
