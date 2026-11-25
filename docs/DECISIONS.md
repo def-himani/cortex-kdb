@@ -61,3 +61,29 @@ workloads, and repeated processing of research papers.
 
 ### Budget
 Target additional service expenditure: $0.
+
+## ADR-008: Local DuckLake Storage
+
+Status: Accepted
+
+### Decision
+Use local DuckLake storage instead of RustFS or
+external object storage.
+
+### Reason
+Local storage satisfies the project requirements
+without introducing additional infrastructure,
+cloud credentials, or service costs.
+
+### Storage Policy
+- Track the kDB bundle in Git.
+- Exclude the lake directory from Git.
+- Export lake snapshots separately for submission.
+- Preserve original research PDFs without modification.
+- Perform database changes through typed actions.
+- Preserve the relationship between Git commits
+  and corresponding lake snapshots.
+
+### Limitation
+Switching Git branches does not restore the
+local DuckLake database to an earlier snapshot.

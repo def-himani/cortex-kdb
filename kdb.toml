@@ -33,3 +33,10 @@ reasoning_effort = "none"
 # s3_endpoint = "http://localhost:9000"
 # key_env = "RUSTFS_ACCESS_KEY"
 # secret_env = "RUSTFS_SECRET_KEY"
+
+[lake]
+# Written by `kdb lake init`. Paths are relative to this file. See kdb.toml.example for RustFS.
+catalog = "lake/catalog.ducklake"
+data_path = "lake/data/"
+team = "hm3686"
+iri_base = "https://data.aegean.ai/vla/hm3686/"
