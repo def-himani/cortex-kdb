@@ -1,8 +1,8 @@
 """Ingest a research paper and add its knowledge to the lake.
 
 The ingestion pipeline:
-1. Register the original PDF.
-2. Divide the paper into page chunks.
+1. Prepare context-aware PDF chunks.
+2. Register the original PDF.
 3. Extract structured facts using Pydantic AI.
 4. Validate extracted evidence against the original PDF.
 5. Convert extracted facts into database rows.
@@ -13,6 +13,8 @@ All database modifications must use typed actions.
 
 from __future__ import annotations
 
+import json
+
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Literal
@@ -20,11 +22,13 @@ from typing import Annotated, Literal
 from kdb_tools import guard
 from kdb_tools.actions import Context
 from kdb_tools.actions.objects import RegisterMedia
-from kdb_tools.agent import Chunk, Quote, extraction_agent, pdf_chunks
+from kdb_tools.agent import Chunk, Quote, extraction_agent
 from kdb_tools.media import sha256_of
 from kdb_tools.tools import Checked, KdbTools
 from pydantic import BaseModel, Field, FiniteFloat
 from pydantic_ai import Agent
+
+from .chunking import calculate_prompt_budget, iter_pdf_chunks
 
 
 # --------------------------------------------------
@@ -230,6 +234,25 @@ def extract(
 
 
 # --------------------------------------------------
+# Context management
+# --------------------------------------------------
+
+
+def get_prompt_budget(context: int) -> int:
+    """Calculate the estimated token budget available for PDF text."""
+
+    output_schema = json.dumps(
+        ChunkFacts.model_json_schema()
+    )
+
+    return calculate_prompt_budget(
+        context=context,
+        instructions=INSTRUCTIONS,
+        output_schema=output_schema,
+    )
+
+
+# --------------------------------------------------
 # Media registration
 # --------------------------------------------------
 
@@ -272,13 +295,30 @@ def ingest(
 ) -> Ingested:
     """Extract knowledge from a paper and write it to the lake."""
 
+    pdf = Path(pdf).absolute()
+
+    # Calculate the available context budget for PDF text.
+    prompt_budget = get_prompt_budget(context)
+
+    # Prepare all chunks before registration or inference.
+    # Reject oversized pages before consuming model resources
+    # or modifying the database.
+    chunks = list(
+        iter_pdf_chunks(
+            pdf=pdf,
+            token_budget=prompt_budget,
+            pages_per_chunk=pages_per_chunk,
+        )
+    )
+
+    # Register the original PDF after successful preflight.
     paper = register(ctx, pdf, origin)
 
     facts: list[ExtractedFact] = []
 
-    for chunk, prompt in pdf_chunks(paper.pdf, pages_per_chunk):
+    for chunk, prompt in chunks:
 
-        # Refuse prompts that exceed the configured context limit.
+        # Retain the professor's original context guard.
         guard.check(prompt, context)
 
         # Extract facts and validate their quotations.
