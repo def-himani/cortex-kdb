@@ -26,9 +26,15 @@ from kdb_tools.agent import Chunk, Quote, extraction_agent
 from kdb_tools.media import sha256_of
 from kdb_tools.tools import Checked, KdbTools
 from pydantic import BaseModel, Field, FiniteFloat
-from pydantic_ai import Agent
+from pydantic_ai import Agent, ModelRetry, RunContext
 
 from .chunking import calculate_prompt_budget, iter_pdf_chunks
+
+from .tables import (
+    TableResultFact,
+    TableEvidenceError,
+    locate_table_result,
+)
 
 
 # --------------------------------------------------
@@ -100,7 +106,7 @@ class ResultFact(EvidenceFact):
 
 
 ExtractedFact = Annotated[
-    Fact | TrainingFact | ResultFact,
+    Fact | TrainingFact | ResultFact | TableResultFact,
     Field(discriminator="kind"),
 ]
 
@@ -136,16 +142,21 @@ Extract the following types of facts:
    Use entity for the model name.
 
 5. result:
-   Reported quantitative experimental results.
+   Reported quantitative experimental results supported by prose.
    Use entity for the evaluated model name.
+
+6. table_result:
+   Reported quantitative experimental results from structured tables.
+   Use entity for the evaluated model name as written in the model cell.
 
 Evidence requirements:
 
 - Every fact must have supporting evidence from the supplied pages.
-- Copy the quote verbatim from the paper.
+- For textual facts, copy the quote verbatim from the paper.
+- For table_result facts, provide the exact cell contents and indices.
 - Page numbers are PDF page numbers starting from 1.
 - Do not invent facts, names, values or evidence.
-- Ensure the quoted text supports the extracted statement.
+- Ensure the evidence supports the extracted statement.
 - Extract only facts relevant to the knowledge database.
 
 Experimental result requirements:
@@ -161,8 +172,21 @@ Experimental result requirements:
 - Resolve references such as "ours" only when the model identity
   is established by the supplied pages.
 
-For now, extract only facts supported by textual quotations.
-Do not infer results from ambiguous tables.
+Table extraction requirements:
+
+- Use table_result for numerical results in structured tables.
+- Table, row and column indices start from 1.
+- Use the explicit table numbers and R/C indices provided.
+- Copy cell_text exactly from the numerical cell.
+- Copy entity exactly from the corresponding model cell.
+- Copy header exactly from the corresponding column header.
+- Identify the model_column and header_row accurately.
+- Preserve the reported numerical scale and metric unit.
+- Do not guess the meaning of missing or ambiguous cells.
+- Use textual result facts for results supported by prose.
+- Extract a table result only when its attribution is clear.
+- Do not extract the same result twice from the table and prose
+  unless they provide distinct supporting evidence.
 
 If the supplied pages contain no relevant supported facts,
 return an empty facts list.
@@ -208,15 +232,58 @@ def make_agent(
     root: Path | None = None,
     settings: dict | None = None,
 ) -> Agent[Chunk, ChunkFacts]:
-    """Create the Pydantic AI agent for structured PDF extraction."""
+    """Create an extraction agent with quote and table validation."""
 
-    return extraction_agent(
+    agent = extraction_agent(
         model,
         ChunkFacts,
         INSTRUCTIONS,
         root=root,
         settings=settings,
     )
+
+    @agent.output_validator
+    def validate_table_results(
+        ctx: RunContext[Chunk],
+        output: ChunkFacts,
+    ) -> ChunkFacts:
+        """Verify numerical results against their actual table cells."""
+
+        problems = []
+
+        for fact in output.facts:
+
+            if not isinstance(fact, TableResultFact):
+                continue
+
+            # Evidence must belong to the current PDF chunk.
+            if fact.page not in ctx.deps.pages:
+                problems.append(
+                    f"Page {fact.page} is outside the supplied chunk"
+                )
+                continue
+
+            # Verify the numerical value, model label and column header.
+            try:
+                locate_table_result(
+                    ctx.deps.document,
+                    fact,
+                )
+
+            except TableEvidenceError as error:
+                problems.append(str(error))
+
+        # Ask the model to correct or remove unsupported facts.
+        if problems:
+            raise ModelRetry(
+                "Correct or remove these unsupported table results "
+                "and return the complete output again:\n"
+                + "\n".join(problems)
+            )
+
+        return output
+
+    return agent
 
 
 def extract(
@@ -321,7 +388,7 @@ def ingest(
         # Retain the professor's original context guard.
         guard.check(prompt, context)
 
-        # Extract facts and validate their quotations.
+        # Extract facts and validate their textual or table evidence.
         extracted = extract(
             agent,
             paper.pdf,

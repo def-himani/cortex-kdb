@@ -2,6 +2,7 @@
 
 from collections.abc import Iterator
 from pathlib import Path
+from .tables import render_tables
 
 import pdfplumber
 
@@ -73,6 +74,10 @@ def iter_pdf_chunks(
             text = page.extract_text() or ""
 
             formatted = format_page(page_number, text)
+            tables = render_tables(page)
+
+            if tables:
+                formatted += "\n\n" + tables
 
             page_tokens = guard.estimate(formatted)
 
