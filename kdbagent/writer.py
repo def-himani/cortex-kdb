@@ -372,6 +372,27 @@ class RowWriter:
             fact,
         )
 
+        # Required experimental conditions must be established
+        # before creating a Result row.
+        required_conditions = (
+            "task",
+            "benchmark",
+            "suite",
+            "embodiment",
+        )
+
+        missing = [
+            name
+            for name in required_conditions
+            if not conditions.get(name)
+        ]
+
+        if missing:
+            raise ResolutionError(
+                "Missing required result conditions: "
+                + ", ".join(missing)
+        )
+        
         if not isinstance(fact, TableResultFact):
 
             if not numeric_value_present(

@@ -457,8 +457,10 @@ def test_writer_creates_grounded_result(ctx, paper):
         "page": 1,
         "value": 53.7,
         "metric": "success rate (%)",
+        "task": "Pick and place",
         "benchmark": "LIBERO",
         "suite": "LIBERO-Long",
+        "embodiment": "Franka Panda",
     }
 
     agent = ingest.make_agent(
@@ -476,7 +478,13 @@ def test_writer_creates_grounded_result(ctx, paper):
 
     rows = ctx.lake.con.execute(
         """
-        SELECT value, suite, trials_reported
+        SELECT
+            value,
+            task,
+            benchmark,
+            suite,
+            embodiment,
+            trials_reported
         FROM results
         """
     ).fetchall()
@@ -484,7 +492,10 @@ def test_writer_creates_grounded_result(ctx, paper):
     assert rows == [
         (
             53.7,
+            ROBOTICS + "tasks/pick-and-place",
+            ROBOTICS + "benchmarks/libero",
             ROBOTICS + "benchmarks/libero-long",
+            ROBOTICS + "embodiments/franka-panda",
             False,
         )
     ]
@@ -512,3 +523,38 @@ def test_repeated_ingestion_does_not_duplicate_rows(ctx, paper):
     assert ctx.lake.con.execute(
         "SELECT count(*) FROM models"
     ).fetchone()[0] == 1
+
+def test_writer_skips_incomplete_result(ctx, paper, caplog):
+
+    seed_robotics_terms(ctx)
+
+    result = {
+        "kind": "result",
+        "entity": "OpenVLA",
+        "sentence": RESULT_QUOTE,
+        "quote": RESULT_QUOTE,
+        "page": 1,
+        "value": 53.7,
+        "metric": "success rate (%)",
+        "benchmark": "LIBERO",
+        "suite": "LIBERO-Long",
+    }
+
+    agent = ingest.make_agent(
+        scripted({"facts": [result]})[0]
+    )
+
+    done = ingest.ingest(
+        ctx,
+        paper,
+        agent,
+        context=32768,
+    )
+
+    assert done.checked.errors == []
+
+    assert ctx.lake.con.execute(
+        "SELECT count(*) FROM results"
+    ).fetchone()[0] == 0
+
+    assert "Missing required result conditions" in caplog.text
