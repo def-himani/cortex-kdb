@@ -558,3 +558,82 @@ def test_writer_skips_incomplete_result(ctx, paper, caplog):
     ).fetchone()[0] == 0
 
     assert "Missing required result conditions" in caplog.text
+
+def test_writer_rejects_dataset_without_collection(
+    ctx,
+    paper,
+    caplog,
+):
+
+    fact = {
+        "kind": "dataset",
+        "entity": "ExampleDataset",
+        "sentence": RESULT_QUOTE,
+        "quote": RESULT_QUOTE,
+        "page": 1,
+    }
+
+    agent = ingest.make_agent(
+        scripted({"facts": [fact]})[0]
+    )
+
+    done = ingest.ingest(
+        ctx,
+        paper,
+        agent,
+        context=32768,
+    )
+
+    assert done.checked.errors == []
+
+    assert ctx.lake.con.execute(
+        "SELECT count(*) FROM datasets"
+    ).fetchone()[0] == 0
+
+    assert "no supported collection method" in caplog.text
+
+
+def test_writer_records_explicit_paper_version(ctx, paper):
+
+    agent = ingest.make_agent(
+        scripted({"facts": [FACT]})[0]
+    )
+
+    ingest.ingest(
+        ctx,
+        paper,
+        agent,
+        context=32768,
+        origin="https://arxiv.org/abs/2406.09246v3",
+    )
+
+    assert ctx.lake.con.execute(
+        "SELECT arxiv_id, version FROM papers"
+    ).fetchall() == [
+        ("2406.09246", "v3")
+    ]
+
+
+def test_library_excludes_held_out_paper():
+
+    from kdbagent.library import (
+        PAPER_VERSIONS,
+        HELD_OUT_PAPER,
+        submission_one_papers,
+        submission_two_paper,
+    )
+
+    root = Path("kdb")
+
+    papers = submission_one_papers(root)
+
+    assert len(PAPER_VERSIONS) == 31
+
+    assert len(papers) == 30
+
+    assert all(
+        paper.stem != HELD_OUT_PAPER
+        for paper in papers
+    )
+
+    assert submission_two_paper(root).stem == HELD_OUT_PAPER

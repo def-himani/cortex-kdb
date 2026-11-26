@@ -27,6 +27,7 @@ from .resolution import (
     ResolutionError,
     TermResolver,
     EntityResolver,
+    normalize_name,
 )
 
 
@@ -94,6 +95,7 @@ def paper_metadata(paper) -> dict:
         "title": title.strip(),
         "arxiv_id": paper.arxiv_id,
         "media": paper.sha256,
+        "version": paper.version,
     }
 
 
@@ -220,13 +222,29 @@ class RowWriter:
                 if previous.get("title"):
                     pending["title"] = previous["title"]
 
+                for key in (
+                    "collection",
+                    "embodiments",
+                    "tasks",
+                    "modalities",
+                    "model_class",
+                ):
+                    if previous.get(key) is not None:
+                        pending[key] = previous[key]
+
         for key, value in fields.items():
 
             # Unknown values must not erase existing values.
             if value is None:
                 continue
 
-            if key == "aliases":
+            if key in (
+                "aliases",
+                "collection",
+                "embodiments",
+                "tasks",
+                "modalities",
+            ):
 
                 pending[key] = unique_items(
                     pending.get(key, []) + value
@@ -292,21 +310,83 @@ class RowWriter:
         name: str,
         references,
         description: str | None = None,
+        properties: dict | None = None,
     ) -> str:
-        """Resolve or create a model or dataset."""
+        """Resolve or create a grounded model or dataset."""
 
         iri = self.entities.resolve(table, name)
+
+        properties = dict(properties or {})
+
+        aliases = unique_items(
+            [name] + properties.pop("aliases", [])
+        )
+
+        # Do not attach an alias already owned by another entity.
+        for alias in aliases:
+
+            matches = self.entities.index.get(
+                (table, normalize_name(alias)),
+                set(),
+            )
+
+            if matches - {iri}:
+
+                raise ResolutionError(
+                    f"Alias {alias!r} belongs to another entity"
+                )
+
+        previous = (
+            self.rows[table].get(iri)
+            or read_row(self.ctx, table, iri)
+            or {}
+        )
+
+        if table == "datasets":
+
+            collection = (
+                previous.get("collection") or []
+            ) + (
+                properties.get("collection") or []
+            )
+
+            if not collection:
+
+                raise ResolutionError(
+                    f"Dataset {name!r} has no supported "
+                    "collection method"
+                )
+
+        if table == "models":
+
+            old_class = previous.get("model_class")
+            new_class = properties.get("model_class")
+
+            if old_class and new_class and old_class != new_class:
+
+                raise ResolutionError(
+                    f"Conflicting model classification for {name!r}"
+                )
 
         self.add_row(
             table,
             iri,
             {
                 "title": name,
-                "aliases": [name],
+                "aliases": aliases,
                 "description": description,
+                **properties,
             },
             references,
         )
+
+        for alias in aliases:
+
+            self.entities.remember(
+                table,
+                alias,
+                iri,
+            )
 
         return iri
 
@@ -335,15 +415,16 @@ class RowWriter:
             fact.dataset,
         )
 
+        # Validate the dataset first: it must already have a collection method.
         self.add_entity(
-            "models",
-            fact.entity,
+            "datasets",
+            fact.dataset,
             references,
         )
 
         self.add_entity(
-            "datasets",
-            fact.dataset,
+            "models",
+            fact.entity,
             references,
         )
 
@@ -392,7 +473,6 @@ class RowWriter:
                 "Missing required result conditions: "
                 + ", ".join(missing)
         )
-        
         if not isinstance(fact, TableResultFact):
 
             if not numeric_value_present(
@@ -458,20 +538,91 @@ class RowWriter:
 
         if fact.kind == "model":
 
+            model_class = self.terms.resolve(
+                fact.model_class,
+                ROBOTICS + "models/",
+            )
+
             self.add_entity(
                 "models",
                 fact.entity,
                 references,
                 description=fact.sentence,
+                properties={
+                    "aliases": fact.aliases,
+                    "model_class": model_class,
+                },
             )
 
         elif fact.kind == "dataset":
+
+            collection = [
+                self.terms.resolve(
+                    name,
+                    DATASETS + "collection/",
+                    VLA_DATASETS + "collection/",
+                )
+                for name in fact.collection
+            ]
+
+            embodiments = [
+                self.terms.resolve(
+                    name,
+                    ROBOTICS + "embodiments/",
+                )
+                for name in fact.embodiments
+            ]
+
+            tasks = [
+                self.terms.resolve(
+                    name,
+                    ROBOTICS + "tasks/",
+                )
+                for name in fact.tasks
+            ]
+
+            # Only resolve modalities that exist as ontology terms.
+            modalities = []
+
+            for name in fact.modalities:
+
+                try:
+                    modalities.append(
+                        self.terms.resolve(
+                            name,
+                            DATASETS + "modalities/",
+                            VLA_DATASETS + "modalities/",
+                            ROBOTICS + "modalities/",
+                        )
+                    )
+
+                except ResolutionError as error:
+
+                    logger.warning(
+                        "Unresolved modality: %s",
+                        error,
+                    )
 
             self.add_entity(
                 "datasets",
                 fact.entity,
                 references,
                 description=fact.sentence,
+                properties={
+                    "aliases": fact.aliases,
+                    "collection": [
+                        item for item in collection if item
+                    ],
+                    "embodiments": [
+                        item for item in embodiments if item
+                    ],
+                    "tasks": [
+                        item for item in tasks if item
+                    ],
+                    "modalities": [
+                        item for item in modalities if item
+                    ],
+                },
             )
 
         elif fact.kind == "training":
@@ -543,7 +694,22 @@ def write_extracted_rows(ctx, paper, facts) -> list[str]:
 
     writer.add_paper()
 
-    for fact in facts:
+    # Establish models and datasets before creating relationships.
+    priority = {
+        "model": 0,
+        "dataset": 1,
+        "benchmark": 2,
+        "training": 3,
+        "result": 4,
+        "table_result": 4,
+    }
+
+    ordered_facts = sorted(
+        facts,
+        key=lambda fact: priority.get(fact.kind, 5),
+    )
+
+    for fact in ordered_facts:
 
         try:
             writer.add_fact(fact)

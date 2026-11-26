@@ -14,6 +14,7 @@ All database modifications must use typed actions.
 from __future__ import annotations
 
 import json
+import re
 
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -61,6 +62,18 @@ class Fact(EvidenceFact):
     """Descriptive knowledge about a model, dataset or benchmark."""
 
     kind: Literal["model", "dataset", "benchmark"]
+
+    aliases: list[str] = Field(default_factory=list)
+
+    model_class: str | None = None
+
+    collection: list[str] = Field(default_factory=list)
+
+    embodiments: list[str] = Field(default_factory=list)
+
+    tasks: list[str] = Field(default_factory=list)
+
+    modalities: list[str] = Field(default_factory=list)
 
 
 class TrainingFact(EvidenceFact):
@@ -160,6 +173,43 @@ Evidence requirements:
 - Ensure the evidence supports the extracted statement.
 - Extract only facts relevant to the knowledge database.
 
+Entity classification requirements:
+
+- Record aliases only when the paper explicitly identifies them
+  as alternative names for the same entity.
+- Never treat different model variants as aliases.
+- For model facts, record model_class when explicitly supported.
+- Use Vision-language-action model for a model explicitly
+  identified as belonging to that category.
+
+Dataset requirements:
+
+- For dataset facts, record how the dataset was collected.
+- Collection methods may include:
+  Human-collected, Programmatically generated, Simulated,
+  Pooled from existing datasets, Teleoperation, Scripted policy,
+  Simulated teleoperation, and Cross-embodiment pooling.
+- Prefer the most specific supported collection method.
+- Record explicitly supported embodiments, tasks and modalities.
+- Use empty lists for unknown list-valued properties.
+- Never infer the collection method merely from a dataset's name.
+
+Training relationship requirements:
+
+- Record the reported training role, such as Pretraining,
+  Fine-tuning, Co-training, Cross-embodiment pretraining,
+  LoRA fine-tuning, or Co-fine-tuning with web data.
+- Extract separate dataset facts when the paper describes
+  how the training datasets were collected.
+- Do not assume a training role when it is not stated.
+
+Result conditions:
+
+- Look for task, benchmark, suite and embodiment in the supplied
+  text before extracting an experimental result.
+- Do not invent missing conditions to complete a result.
+- A missing trial count must not be replaced with an estimate.
+
 Experimental result requirements:
 
 - Preserve the numerical value as reported.
@@ -205,6 +255,7 @@ class Paper:
 
     pdf: Path
     sha256: str
+    version: str | None = None
 
     @property
     def arxiv_id(self) -> str:
@@ -342,9 +393,21 @@ def register(
         },
     )
 
+    version = None
+
+    if origin:
+        match = re.search(
+            rf"{re.escape(pdf.stem)}(v\d+)(?:\.pdf)?(?:$|[?#])",
+            origin,
+        )
+
+        if match:
+            version = match.group(1)
+
     return Paper(
         pdf=pdf,
         sha256=sha256_of(pdf.read_bytes()),
+        version=version,
     )
 
 
