@@ -262,10 +262,24 @@ def test_the_ingest_agent_sends_back_a_quote_that_is_not_on_the_page(paper):
     assert any("one million" in str(s) for s in seen)
 
 
-def test_the_ingest_agent_can_look_quotes_up_itself(paper):
-    agent = ingest.make_agent(scripted({"facts": []})[0], root=paper.parents[1])
-    names = {name for ts in agent.toolsets for name in getattr(ts, "tools", {})}
-    assert {"find_quote", "find_value", "find_cell", "check_pages"} <= names
+def test_ingest_agent_disables_optional_tools_to_reduce_context(paper):
+    agent = ingest.make_agent(
+        scripted({"facts": []})[0],
+        root=paper.parents[1],
+    )
+
+    names = {
+        name
+        for ts in agent.toolsets
+        for name in getattr(ts, "tools", {})
+    }
+
+    assert not names.intersection({
+        "find_quote",
+        "find_value",
+        "find_cell",
+        "check_pages",
+    })
 
 
 FACT = {"entity": "OpenVLA", "kind": "model", "sentence": "OpenVLA reaches 53.7% on LIBERO-Long.", "quote": RESULT_QUOTE,

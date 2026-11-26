@@ -323,7 +323,7 @@ def make_agent(
         model,
         ChunkFacts,
         INSTRUCTIONS,
-        root=root,
+        root=None,
         settings=settings,
     )
 
@@ -454,7 +454,7 @@ def ingest(
     pdf: Path,
     agent: Agent[Chunk, ChunkFacts],
     context: int,
-    pages_per_chunk: int = 3,
+    pages_per_chunk: int = 1,
     origin: str | None = None,
 ) -> Ingested:
     """Extract knowledge from a paper and write it to the lake."""
@@ -482,7 +482,15 @@ def ingest(
     facts: list[ExtractedFact] = []
     diagnostics = []
 
-    for chunk, prompt in chunks:
+    for index, (chunk, prompt) in enumerate(chunks, start=1):
+
+        print(
+            f"Processing chunk {index}/{len(chunks)} | "
+            f"Pages: {chunk.pages} | "
+            f"Estimated PDF tokens: {guard.estimate(prompt):,}",
+            flush=True,
+        )
+
         guard.check(prompt, context)
         chunk_started = perf_counter()
 
@@ -493,13 +501,26 @@ def ingest(
         facts.extend(result.output.facts)
 
         keys = ("input_tokens", "output_tokens", "requests", "tool_calls", "cache_read_tokens")
+
         diagnostics.append({
             "pages": list(chunk.pages),
             "estimated_pdf_tokens": guard.estimate(prompt),
             "facts": len(result.output.facts),
-            "usage": {key: int(getattr(usage, key, 0) or 0) for key in keys},
+            "usage": {
+                key: int(getattr(usage, key, 0) or 0)
+                for key in keys
+            },
             "elapsed_seconds": round(perf_counter() - chunk_started, 3),
         })
+
+        print(
+            f"Completed chunk {index}/{len(chunks)} | "
+            f"Facts: {len(result.output.facts)} | "
+            f"Input tokens: {usage.input_tokens:,} | "
+            f"Output tokens: {usage.output_tokens:,} | "
+            f"Elapsed: {perf_counter() - chunk_started:.1f}s",
+            flush=True,
+        )
 
     # Preserve the starter's write_rows hook and its list return contract.
     rows = write_rows(ctx, paper, facts)
