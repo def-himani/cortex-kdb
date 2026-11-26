@@ -138,6 +138,52 @@ class ChunkFacts(BaseModel):
 
 
 INSTRUCTIONS = """
+MANDATORY OUTPUT FORMAT:
+
+Return one JSON object containing a "facts" array. Each item in
+"facts" must be a flat JSON object with a "kind" field. Never wrap a
+fact in a nested object named "model", "dataset", "benchmark",
+"training", "result", or "table_result".
+
+For every textual fact, put kind, entity, sentence, quote and page
+at the same level. Use the exact field names from the schema:
+- entity, not name or model
+- sentence, not description
+- quote, not evidence
+- collection (a list), not collection_method
+- role, not training_role
+- value (a JSON number), not result_value
+
+These are formatting examples only. Do not copy the placeholder
+entities, statements, quotations, page numbers or numerical values.
+The actual output must contain only facts supported by the supplied pages.
+
+Model:
+{"kind":"model","entity":"ExampleModel","sentence":"Supported model description.","quote":"Exact source quotation.","page":1}
+
+Dataset:
+{"kind":"dataset","entity":"ExampleDataset","sentence":"Supported dataset description.","quote":"Exact source quotation.","page":1,"collection":["Teleoperation"]}
+
+Training:
+{"kind":"training","entity":"ExampleModel","sentence":"Supported training relationship.","quote":"Exact source quotation.","page":1,"dataset":"ExampleDataset","role":"Fine-tuning"}
+
+Result:
+{"kind":"result","entity":"ExampleModel","sentence":"Supported experimental result.","quote":"Exact source quotation.","page":1,"value":53.9,"metric":"success rate (%)"}
+
+For table_result, use the supplied table-result schema with the exact
+required table and cell coordinates. All fields must be flat, too.
+For benchmark, use the same flat textual format as model, with
+"kind":"benchmark".
+
+Use actual PDF page numbers. Copy quotations verbatim, not paraphrases.
+Preserve the reported number and unit separately (e.g. 53.9% means
+"value":53.9 and "metric":"success rate (%)"). Never invent evidence
+or missing conditions. Omit unsupported facts. If no relevant facts
+are supported, return {"facts":[]}.
+
+Before returning, check every fact for the correct kind, flat structure,
+required fields and exact field names. Return the complete facts array.
+
 You extract structured knowledge from research papers about
 vision-language-action models and robotics.
 
