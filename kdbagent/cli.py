@@ -18,6 +18,8 @@ from pydantic_ai.exceptions import AgentRunError
 
 from . import ask, ingest
 from . import lake as KL
+from .batch import atomic_json, run_library
+from .conflicts import record_contested
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -31,6 +33,15 @@ def main(argv: list[str] | None = None) -> int:
     i = sub.add_parser("ingest", help="add one paper to the lake")
     i.add_argument("pdf", type=Path)
     i.add_argument("--origin", help="where the PDF came from; default: its arXiv page")
+    i.add_argument("--report", type=Path, help="write ingestion diagnostics as JSON")
+    batch = sub.add_parser("ingest-library", help="ingest or resume the 30 Submission 1 papers")
+    batch.add_argument("--limit", type=int, help="maximum number of new paper attempts")
+    batch.add_argument("--paper", help="attempt only this unversioned initial-library arXiv ID")
+    contest = sub.add_parser("contest", help="record a reviewed contradiction between grounded rows")
+    contest.add_argument("claim", help="<row IRI>#evidence/<index>")
+    contest.add_argument("disputed_by", nargs="+", help="one or more disputing evidence references")
+    contest.add_argument("--confirm", action="store_true", required=True,
+                         help="confirm that you reviewed the evidence and established a real contradiction")
     a = sub.add_parser("ask", help="answer a question from the lake")
     a.add_argument("question")
     a.add_argument("--show", action="store_true", help="show each cited region with its highlight")
@@ -53,6 +64,14 @@ def main(argv: list[str] | None = None) -> int:
             print(f"exported to {export(KL.lake_config(toml), root, args.out)}")
         elif args.cmd == "ingest":
             return _ingest(toml, root, args)
+        elif args.cmd == "ingest-library":
+            return run_library(toml, root, limit=args.limit, paper_id=args.paper)
+        elif args.cmd == "contest":
+            ctx = KL.open_context(toml, root)
+            try:
+                print(f"recorded {record_contested(ctx, args.claim, args.disputed_by)}")
+            finally:
+                ctx.lake.close()
         else:
             cfg = config.load(toml)
             guard.check(args.question, cfg.context)
@@ -67,13 +86,14 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     except FileNotFoundError as e:
         if Path(e.filename or "") != toml:
-            raise
+            print(f"kdb {name}: {e}", file=sys.stderr)
+            return 1
         print(f"kdb {name}: there is no {toml}; copy kdb.toml.example to kdb.toml", file=sys.stderr)
         return 1
     except AgentRunError as e:  # the model gave up, ran out of retries or hit a usage limit
         print(f"kdb {name}: the model run failed: {e}", file=sys.stderr)
         return 1
-    except (KL.LakeError, ExportError, Failed, config.ConfigError, guard.PromptTooLong, duckdb.Error) as e:
+    except (KL.LakeError, ExportError, Failed, config.ConfigError, guard.PromptTooLong, duckdb.Error, ValueError, OSError) as e:
         print(f"kdb {name}: {e}", file=sys.stderr)
         return 1
     return 0
@@ -88,8 +108,17 @@ def _ingest(toml: Path, root: Path, args) -> int:
     finally:
         ctx.lake.close()
     print(f"{len(done.facts)} facts, {len(done.rows)} rows written")
+    print(f"{len(done.chunks)} chunks, {len(done.skipped)} skipped facts, "
+          f"{len(done.candidates)} potential conflicts requiring review")
+    usage = done.usage
+    print(f"Model usage: {usage['input_tokens']:,} input tokens, {usage['output_tokens']:,} output tokens, "
+          f"{usage['requests']} requests, {usage['tool_calls']} tool calls")
+    print(f"Elapsed: {done.elapsed_seconds:.1f} seconds")
     for problem in done.checked.errors + done.checked.warnings:
         print(f"{problem.level} {problem.rule} {problem.path}: {problem.message}")
+    if args.report:
+        atomic_json(args.report, done.report())
+        print(f"Report: {args.report}")
     return 1 if done.checked.errors else 0
 
 

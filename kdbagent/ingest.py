@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import re
+from time import perf_counter
 
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -272,6 +273,38 @@ class Ingested:
     facts: list[ExtractedFact]
     rows: list[str]
     checked: Checked = field(default_factory=Checked)
+    chunks: list[dict] = field(default_factory=list)
+    skipped: list[dict] = field(default_factory=list)
+    candidates: list[dict] = field(default_factory=list)
+    touched_rows: list[str] = field(default_factory=list)
+    elapsed_seconds: float = 0.0
+
+    @property
+    def usage(self) -> dict[str, int]:
+        """Reported model usage, summed across completed chunk runs."""
+        keys = ("input_tokens", "output_tokens", "requests", "tool_calls", "cache_read_tokens")
+        return {
+            key: sum(chunk["usage"].get(key, 0) for chunk in self.chunks)
+            for key in keys
+        }
+
+    def report(self) -> dict:
+        """Machine-readable report for CLI and batch checkpoints."""
+        return {
+            "arxiv_id": self.paper.arxiv_id,
+            "sha256": self.paper.sha256,
+            "version": self.paper.version,
+            "facts": len(self.facts),
+            "rows": list(self.rows),
+            "touched_rows": self.touched_rows,
+            "skipped": self.skipped,
+            "candidates": self.candidates,
+            "chunks": self.chunks,
+            "usage": self.usage,
+            "elapsed_seconds": round(self.elapsed_seconds, 3),
+            "errors": [str(p) for p in self.checked.errors],
+            "warnings": [str(p) for p in self.checked.warnings],
+        }
 
 
 # --------------------------------------------------
@@ -426,6 +459,7 @@ def ingest(
 ) -> Ingested:
     """Extract knowledge from a paper and write it to the lake."""
 
+    started = perf_counter()
     pdf = Path(pdf).absolute()
 
     # Calculate the available context budget for PDF text.
@@ -446,31 +480,41 @@ def ingest(
     paper = register(ctx, pdf, origin)
 
     facts: list[ExtractedFact] = []
+    diagnostics = []
 
     for chunk, prompt in chunks:
-
-        # Retain the professor's original context guard.
         guard.check(prompt, context)
+        chunk_started = perf_counter()
 
-        # Extract facts and validate their textual or table evidence.
-        extracted = extract(
-            agent,
-            paper.pdf,
-            chunk.pages,
-            prompt,
-        )
+        # Keep the public extract() helper unchanged for existing callers.
+        # Here retain the run result so reported usage includes retries.
+        result = agent.run_sync(prompt, deps=chunk)
+        usage = result.usage
+        facts.extend(result.output.facts)
 
-        facts.extend(extracted.facts)
+        keys = ("input_tokens", "output_tokens", "requests", "tool_calls", "cache_read_tokens")
+        diagnostics.append({
+            "pages": list(chunk.pages),
+            "estimated_pdf_tokens": guard.estimate(prompt),
+            "facts": len(result.output.facts),
+            "usage": {key: int(getattr(usage, key, 0) or 0) for key in keys},
+            "elapsed_seconds": round(perf_counter() - chunk_started, 3),
+        })
 
-    # Convert extracted facts into database rows.
+    # Preserve the starter's write_rows hook and its list return contract.
     rows = write_rows(ctx, paper, facts)
+    touched = list(getattr(rows, "touched", rows))
 
-    # Validate only the rows written during this ingestion.
     return Ingested(
         paper=paper,
         facts=facts,
-        rows=rows,
-        checked=check(ctx, rows),
+        rows=list(rows),
+        checked=check(ctx, touched),
+        chunks=diagnostics,
+        skipped=list(getattr(rows, "skipped", [])),
+        candidates=list(getattr(rows, "candidates", [])),
+        touched_rows=touched,
+        elapsed_seconds=perf_counter() - started,
     )
 
 

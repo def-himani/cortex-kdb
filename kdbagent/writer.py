@@ -9,6 +9,9 @@ import re
 import pdfplumber
 
 from kdb_tools.actions.objects import UpsertObjects, read_row
+from kdb_tools.validate import normalize_name as profile_name
+
+from .conflicts import result_candidates
 
 from .evidence import (
     EvidenceError,
@@ -28,6 +31,7 @@ from .resolution import (
     TermResolver,
     EntityResolver,
     normalize_name,
+    entity_iri,
 )
 
 
@@ -163,6 +167,16 @@ def resolve_conditions(resolver, fact) -> dict:
     }
 
 
+class WrittenRows(list):
+    """A list of changed row paths, with diagnostics for the caller."""
+
+    def __init__(self, changed, *, touched, skipped, candidates):
+        super().__init__(changed)
+        self.touched = touched
+        self.skipped = skipped
+        self.candidates = candidates
+
+
 class RowWriter:
     """Prepare and submit grounded rows without overwriting old evidence."""
 
@@ -180,6 +194,32 @@ class RowWriter:
         }
 
         self.references = []
+        self.skipped = []
+        # Match the course's cross-table uniqueness rule, but do not use
+        # its lossy normalization to silently merge different variants.
+        self.name_owners = {}
+        for table in ("papers", "models", "datasets"):
+            columns = "iri, title" if table == "papers" else "iri, title, aliases"
+            for row in ctx.lake.con.execute(f"SELECT {columns} FROM {table}").fetchall():
+                iri, title = row[:2]
+                aliases = row[2] or [] if len(row) == 3 else []
+                self.remember_names(table, iri, [title, *aliases])
+
+    def remember_names(self, table, iri, names):
+        for name in names:
+            if name and profile_name(name):
+                self.name_owners.setdefault(profile_name(name), set()).add((table, iri))
+
+    def check_names(self, table, iri, names):
+        for name in names:
+            if not name or not profile_name(name):
+                continue
+            owners = self.name_owners.get(profile_name(name), set())
+            if owners - {(table, iri)}:
+                raise ResolutionError(
+                    f"Name collision under course normalization: {name!r}; "
+                    "explicit identity review required"
+                )
 
     def add_row(
         self,
@@ -298,11 +338,17 @@ class RowWriter:
             + self.paper.arxiv_id
         )
 
-        self.add_row(
-            "papers",
-            iri,
-            paper_metadata(self.paper),
-        )
+        previous = read_row(self.ctx, "papers", iri) or {}
+        if previous.get("media") and previous["media"] != self.paper.sha256:
+            raise ResolutionError(
+                f"Paper {self.paper.arxiv_id} already has different registered bytes"
+            )
+        fields = paper_metadata(self.paper)
+        if previous.get("version") and fields.get("version") and previous["version"] != fields["version"]:
+            raise ResolutionError(f"Conflicting paper version for {self.paper.arxiv_id}")
+        self.check_names("papers", iri, [fields["title"]])
+        self.add_row("papers", iri, fields)
+        self.remember_names("papers", iri, [fields["title"]])
 
     def add_entity(
         self,
@@ -314,27 +360,25 @@ class RowWriter:
     ) -> str:
         """Resolve or create a grounded model or dataset."""
 
-        iri = self.entities.resolve(table, name)
-
+        if table == "models" and normalize_name(name) in {
+            "ours", "our model", "our method", "proposed model", "proposed method", "this work",
+        }:
+            raise ResolutionError(f"Unresolved model identity: {name!r}")
         properties = dict(properties or {})
 
         aliases = unique_items(
             [name] + properties.pop("aliases", [])
         )
 
-        # Do not attach an alias already owned by another entity.
+        # Only an exact normalized name or an explicitly extracted alias
+        # can establish identity. Refuse ambiguous merges.
+        matches = set()
         for alias in aliases:
-
-            matches = self.entities.index.get(
-                (table, normalize_name(alias)),
-                set(),
-            )
-
-            if matches - {iri}:
-
-                raise ResolutionError(
-                    f"Alias {alias!r} belongs to another entity"
-                )
+            matches.update(self.entities.index.get((table, normalize_name(alias)), set()))
+        if len(matches) > 1:
+            raise ResolutionError(f"Aliases identify multiple {table} rows: {aliases!r}")
+        iri = next(iter(matches)) if matches else entity_iri(self.ctx.iri_base, table, name)
+        self.check_names(table, iri, aliases)
 
         previous = (
             self.rows[table].get(iri)
@@ -388,6 +432,7 @@ class RowWriter:
                 iri,
             )
 
+        self.remember_names(table, iri, aliases)
         return iri
 
     def add_training(self, fact, references) -> None:
@@ -404,29 +449,9 @@ class RowWriter:
                 "Training relationship has no reported role"
             )
 
-        # Resolve both identities before preparing rows.
-        model = self.entities.resolve(
-            "models",
-            fact.entity,
-        )
-
-        dataset = self.entities.resolve(
-            "datasets",
-            fact.dataset,
-        )
-
-        # Validate the dataset first: it must already have a collection method.
-        self.add_entity(
-            "datasets",
-            fact.dataset,
-            references,
-        )
-
-        self.add_entity(
-            "models",
-            fact.entity,
-            references,
-        )
+        # Validate the dataset first: no placeholder dataset without collection.
+        dataset = self.add_entity("datasets", fact.dataset, references)
+        model = self.add_entity("models", fact.entity, references)
 
         iri = (
             self.ctx.iri_base
@@ -651,6 +676,17 @@ class RowWriter:
             )
 
         written = []
+        touched = []
+
+        # Dry-run every table before beginning row writes. Re-plan at
+        # submission because each committed action advances the snapshot.
+        for table, class_name in TABLE_CLASSES.items():
+            rows = list(self.rows[table].values())
+            if rows:
+                UpsertObjects().dry_run(self.ctx, {
+                    "class_iri": VLA_CLASSES + class_name,
+                    "rows": rows,
+                })
 
         for table, class_name in TABLE_CLASSES.items():
 
@@ -683,8 +719,10 @@ class RowWriter:
                 f"{table}/{edit.iri}"
                 for edit in plan.row_edits
             )
+            touched.extend(f"{table}/{row['iri']}" for row in rows)
 
-        return written
+        candidates = result_candidates(self.ctx, set(self.rows["results"]))
+        return WrittenRows(written, touched=touched, skipped=self.skipped, candidates=candidates)
 
 
 def write_extracted_rows(ctx, paper, facts) -> list[str]:
@@ -711,6 +749,13 @@ def write_extracted_rows(ctx, paper, facts) -> list[str]:
 
     for fact in ordered_facts:
 
+        if fact.kind == "benchmark":
+            writer.skipped.append({
+                "kind": fact.kind, "entity": fact.entity, "page": fact.page,
+                "reason": "Benchmark facts are ontology-only in the current schema",
+                "fact": fact.model_dump(mode="json"),
+            })
+            continue
         try:
             writer.add_fact(fact)
 
@@ -720,6 +765,10 @@ def write_extracted_rows(ctx, paper, facts) -> list[str]:
             TableEvidenceError,
         ) as error:
 
+            writer.skipped.append({
+                "kind": fact.kind, "entity": fact.entity, "page": fact.page,
+                "reason": str(error), "fact": fact.model_dump(mode="json"),
+            })
             logger.warning(
                 "Skipped %s fact about %s on page %s: %s",
                 fact.kind,
