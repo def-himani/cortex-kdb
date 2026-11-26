@@ -272,14 +272,43 @@ FACT = {"entity": "OpenVLA", "kind": "model", "sentence": "OpenVLA reaches 53.7%
         "page": 1}
 
 
-def test_ingest_registers_the_paper_and_leaves_the_rows_to_you(ctx, paper):
-    agent = ingest.make_agent(scripted({"facts": [FACT]})[0])
-    with pytest.raises(NotImplementedError, match="UpsertObjects") as e:
-        ingest.ingest(ctx, paper, agent, context=32768)
-    assert "dry_run" in str(e.value)
-    row = M.lookup(ctx.lake, M.sha256_of(paper.read_bytes()))
-    assert row["origin"] == "https://arxiv.org/abs/2406.09246" and ctx.store.exists(row["object_key"])
+def test_ingest_registers_paper_and_writes_rows(ctx, paper):
 
+    agent = ingest.make_agent(
+        scripted({"facts": [FACT]})[0]
+    )
+
+    done = ingest.ingest(
+        ctx,
+        paper,
+        agent,
+        context=32768,
+    )
+
+    assert done.rows
+
+    assert done.checked.errors == []
+
+    registered = M.lookup(
+        ctx.lake,
+        M.sha256_of(paper.read_bytes()),
+    )
+
+    assert registered is not None
+
+    assert registered["origin"] == (
+        "https://arxiv.org/abs/2406.09246"
+    )
+
+    assert ctx.store.exists(
+        registered["object_key"]
+    )
+
+    models = ctx.lake.con.execute(
+        "SELECT title FROM models"
+    ).fetchall()
+
+    assert ("OpenVLA",) in models
 
 def seed_robotics_terms(ctx):
     """What okf-seed does with the papers of the library, here for four terms of this test's paper."""
@@ -346,11 +375,28 @@ def test_ingest_then_the_checks_then_export_and_restore(ctx, paper, initialized,
     ctx.lake = Lake.open(load_config(initialized / "kdb.toml"))  # for the fixture to close
 
 
-def test_kdb_ingest_says_write_rows_is_yours(initialized, paper, monkeypatch, capsys):
-    monkeypatch.setattr(config, "model_from", lambda cfg: scripted({"facts": [FACT]})[0])
-    assert kdb(initialized, "ingest", str(paper)) == 2
-    err = capsys.readouterr().err
-    assert "not written yet" in err and "UpsertObjects" in err
+def test_kdb_ingest_writes_rows(
+    initialized,
+    paper,
+    monkeypatch,
+    capsys,
+):
+
+    monkeypatch.setattr(
+        config,
+        "model_from",
+        lambda cfg: scripted({"facts": [FACT]})[0],
+    )
+
+    assert kdb(
+        initialized,
+        "ingest",
+        str(paper),
+    ) == 0
+
+    output = capsys.readouterr().out
+
+    assert "rows written" in output
 
 
 # --- ask ---
@@ -398,3 +444,71 @@ def test_a_model_run_that_fails_is_a_clear_message(initialized, monkeypatch, cap
     assert kdb(initialized, "ask", "What is OpenVLA?") == 1
     assert capsys.readouterr().err == ("kdb ask: the model run failed: Exceeded maximum retries (1) for output "
                                        "validation\n")
+
+def test_writer_creates_grounded_result(ctx, paper):
+
+    seed_robotics_terms(ctx)
+
+    result = {
+        "kind": "result",
+        "entity": "OpenVLA",
+        "sentence": RESULT_QUOTE,
+        "quote": RESULT_QUOTE,
+        "page": 1,
+        "value": 53.7,
+        "metric": "success rate (%)",
+        "benchmark": "LIBERO",
+        "suite": "LIBERO-Long",
+    }
+
+    agent = ingest.make_agent(
+        scripted({"facts": [result]})[0]
+    )
+
+    done = ingest.ingest(
+        ctx,
+        paper,
+        agent,
+        context=32768,
+    )
+
+    assert done.checked.errors == []
+
+    rows = ctx.lake.con.execute(
+        """
+        SELECT value, suite, trials_reported
+        FROM results
+        """
+    ).fetchall()
+
+    assert rows == [
+        (
+            53.7,
+            ROBOTICS + "benchmarks/libero-long",
+            False,
+        )
+    ]
+
+
+def test_repeated_ingestion_does_not_duplicate_rows(ctx, paper):
+
+    for _ in range(2):
+
+        agent = ingest.make_agent(
+            scripted({"facts": [FACT]})[0]
+        )
+
+        ingest.ingest(
+            ctx,
+            paper,
+            agent,
+            context=32768,
+        )
+
+    assert ctx.lake.con.execute(
+        "SELECT count(*) FROM papers"
+    ).fetchone()[0] == 1
+
+    assert ctx.lake.con.execute(
+        "SELECT count(*) FROM models"
+    ).fetchone()[0] == 1

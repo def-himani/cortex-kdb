@@ -29,6 +29,7 @@ from pydantic import BaseModel, Field, FiniteFloat
 from pydantic_ai import Agent, ModelRetry, RunContext
 
 from .chunking import calculate_prompt_budget, iter_pdf_chunks
+from .writer import write_extracted_rows
 
 from .tables import (
     TableResultFact,
@@ -440,31 +441,10 @@ def write_rows(
     paper: Paper,
     facts: list[ExtractedFact],
 ) -> list[str]:
-    """Convert extracted facts into grounded database rows.
+    """Convert extracted facts into grounded database rows."""
 
-    Implementation pending:
-    - Paper metadata
-    - Entity resolution
-    - Ontology term resolution
-    - Model rows
-    - Dataset rows
-    - Training relationships
-    - Experimental results
-    - Contested claims
-    - Evidence bounding boxes
-    - PDF annotations
-    - Typed database actions
-    """
-
-    raise NotImplementedError(
-        "write_rows is yours: turn the facts into rows of the VLA tables "
-        "(papers, models, datasets, trained_on, results) with the "
-        "UpsertObjects action. Call UpsertObjects().dry_run(ctx, params) "
-        "first to see the rows it would write and what it refuses, then "
-        "UpsertObjects().submit(ctx, params, plan). Cite evidence as "
-        "MediaRefs to paper.sha256 with bboxes from "
-        "kdb_tools.locate.find_quote, highlight each quote with "
-        "kdb_tools.annotate.highlight, and register the highlighted copy "
-        "with RegisterMedia (annotates=paper.sha256). "
-        "Return the rows you wrote, each as <table>/<iri>"
+    return write_extracted_rows(
+        ctx,
+        paper,
+        facts,
     )
