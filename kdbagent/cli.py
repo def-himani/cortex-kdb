@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import sqlite3
 from pathlib import Path
 
 import duckdb
@@ -20,6 +21,9 @@ from . import ask, ingest
 from . import lake as KL
 from .batch import atomic_json, run_library
 from .conflicts import record_contested
+from .analysis_store import save_analysis
+from .citations import CitationError, collect_citations, render_answer, show_citations, validate_citations
+from . import history as H
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -48,15 +52,19 @@ def main(argv: list[str] | None = None) -> int:
     a.add_argument("--save", action="store_true", help="file the answer back into the lake as an Analysis row")
     e = sub.add_parser("export", help="write the lake into a folder to submit, such as your shared Drive folder")
     e.add_argument("out", type=Path)
-    sub.add_parser("history", help="list earlier questions, answers and citations")
+    h = sub.add_parser("history", help="list earlier questions, answers and citations")
+    h.add_argument("--paper", help="filter by arXiv ID, optionally including its version")
+    h.add_argument("--limit", type=int, default=50, help="maximum number of records (default: 50)")
+    h.add_argument("--id", type=int, help="retrieve a particular recorded answer")
+    h.add_argument("--json", action="store_true", help="include full conversation and metadata as JSON")
     args = p.parse_args(argv)
     toml = args.config or KL.find_config()
     root = args.kdb or toml.absolute().parent / "kdb"
     name = "lake init" if args.cmd == "lake" else args.cmd
     try:
-        if args.cmd == "history" or (args.cmd == "ask" and (args.show or args.save)):
-            raise NotImplementedError("the SQLite history, --show and --save")
-        if args.cmd == "lake":
+        if args.cmd == "history":
+            H.print_history(H.history_path(root), args.paper, args.limit, args.id, args.json)
+        elif args.cmd == "lake":
             for line in KL.init(toml, root, args.team):
                 print(line)
             print(f"the lake of {args.team} is ready")
@@ -72,20 +80,8 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"recorded {record_contested(ctx, args.claim, args.disputed_by)}")
             finally:
                 ctx.lake.close()
-        else:
-            cfg = config.load(toml)
-            guard.check(args.question, cfg.context)
-            ctx = KL.open_context(toml, root, model=cfg.model)
-            try:
-                out = ask.answer(ask.make_agent(config.model_from(cfg), config.settings_from(cfg)), ctx, args.question)
-            finally:
-                ctx.lake.close()
-            # Keep the structured answer format; source rendering and history follow in Batch 11.
-            print(out.model_dump_json(indent=1))
-            usage = out.usage
-            print(f"Model usage: {usage['input_tokens']:,} input tokens, {usage['output_tokens']:,} output tokens, "
-                  f"{usage['requests']} requests, {usage['tool_calls']} tool calls")
-            print(f"Elapsed: {out.elapsed_seconds:.1f} seconds")
+        elif args.cmd == "ask":
+            return _ask(toml, root, args)
     except NotImplementedError as e:
         print(f"kdb {name}: not written yet: {e}", file=sys.stderr)
         return 2
@@ -98,9 +94,50 @@ def main(argv: list[str] | None = None) -> int:
     except AgentRunError as e:  # the model gave up, ran out of retries or hit a usage limit
         print(f"kdb {name}: the model run failed: {e}", file=sys.stderr)
         return 1
-    except (KL.LakeError, ExportError, Failed, config.ConfigError, guard.PromptTooLong, duckdb.Error, ValueError, OSError) as e:
+    except (KL.LakeError, ExportError, Failed, config.ConfigError, guard.PromptTooLong, duckdb.Error, sqlite3.Error, ValueError, OSError) as e:
         print(f"kdb {name}: {e}", file=sys.stderr)
         return 1
+    return 0
+
+
+def _ask(toml: Path, root: Path, args) -> int:
+    cfg = config.load(toml)
+    guard.check(args.question, cfg.context)
+    ctx = KL.open_context(toml, root, model=cfg.model)
+    try:
+        snapshot = ctx.lake.snapshot()
+        commit, dirty = H.git_provenance(toml.absolute().parent)
+        agent = ask.make_agent(config.model_from(cfg), config.settings_from(cfg))
+        out = ask.answer(agent, ctx, args.question)
+        citations = collect_citations(ctx, out)
+        validate_citations(ctx, citations)
+        if ctx.lake.snapshot() != snapshot:
+            raise CitationError("The lake changed during answering; retry against a stable snapshot")
+        rendered = render_answer(out, citations)
+        path = H.history_path(root)
+        run_id = H.record(path, args.question, out, rendered, citations, cfg.model, snapshot, commit, dirty)
+        print(rendered)
+        usage = out.usage
+        print(f"Model usage: {usage.get('input_tokens', 0):,} input tokens, "
+              f"{usage.get('output_tokens', 0):,} output tokens, "
+              f"{usage.get('requests', 0)} requests, {usage.get('tool_calls', 0)} tool calls")
+        print(f"Elapsed: {out.elapsed_seconds:.1f} seconds")
+        print(f"History: #{run_id} (lake snapshot {snapshot})")
+        if args.show:
+            if not citations:
+                print("No cited regions to display.")
+            else:
+                for image in show_citations(ctx, citations, path.parent / "evidence-images" / str(run_id)):
+                    print(f"Highlighted evidence: {image}")
+        if args.save:
+            if not out.answerable:
+                print("Analysis not saved: the answer is unsupported.")
+            else:
+                iri = save_analysis(ctx, args.question, out)
+                H.link_analysis(path, run_id, iri)
+                print(f"Saved analysis: {iri}")
+    finally:
+        ctx.lake.close()
     return 0
 
 

@@ -422,9 +422,9 @@ def test_the_ask_agent_sends_back_evidence_that_is_not_on_the_row(ctx, paper):
     assert any("evidence[3]" in str(s) for s in seen) and any("made-up" in str(s) for s in seen)
 
 
-def test_commands_still_to_write_say_so(initialized, capsys):
-    assert kdb(initialized, "history") == 2
-    assert "not written yet" in capsys.readouterr().err
+def test_history_is_initially_empty(initialized, capsys):
+    assert kdb(initialized, "history") == 0
+    assert "No matching question history" in capsys.readouterr().out
 
 
 def test_a_missing_kdb_toml_says_to_copy_the_example(tmp_path, capsys):
