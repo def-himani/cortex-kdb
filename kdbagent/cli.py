@@ -80,7 +80,12 @@ def main(argv: list[str] | None = None) -> int:
                 out = ask.answer(ask.make_agent(config.model_from(cfg), config.settings_from(cfg)), ctx, args.question)
             finally:
                 ctx.lake.close()
-            print(out.model_dump_json(indent=1))  # yours: print each claim with its paper, page and quote
+            # Keep the structured answer format; source rendering and history follow in Batch 11.
+            print(out.model_dump_json(indent=1))
+            usage = out.usage
+            print(f"Model usage: {usage['input_tokens']:,} input tokens, {usage['output_tokens']:,} output tokens, "
+                  f"{usage['requests']} requests, {usage['tool_calls']} tool calls")
+            print(f"Elapsed: {out.elapsed_seconds:.1f} seconds")
     except NotImplementedError as e:
         print(f"kdb {name}: not written yet: {e}", file=sys.stderr)
         return 2
